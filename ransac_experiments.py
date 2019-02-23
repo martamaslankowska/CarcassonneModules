@@ -1,0 +1,278 @@
+from __future__ import print_function
+import cv2
+import numpy as np
+from matplotlib import pyplot as plt
+from time import time
+import glob
+from PIL import Image
+from resizeimage import resizeimage
+from sklearn.cluster import KMeans
+
+
+
+minHessian = 400
+
+
+def find_keypoints(img_tile, img_board, minHessian=400):
+    detector = cv2.xfeatures2d.SURF_create(hessianThreshold=minHessian)
+    keypoints_tile, descriptors_tile = detector.detectAndCompute(img_tile, None)
+    keypoints_board, descriptors_board = detector.detectAndCompute(img_board, None)
+    return keypoints_tile, descriptors_tile, keypoints_board, descriptors_board
+
+
+def find_good_matches(des_tile, des_board):
+    # Since SURF is a floating-point descriptor NORM_L2 is used
+    matcher = cv2.DescriptorMatcher_create(cv2.DescriptorMatcher_FLANNBASED)
+    knn_matches = matcher.knnMatch(des_tile, des_board, 2)
+
+    # -- Filter matches using the Lowe's ratio test
+    ratio_thresh = 0.75
+    good_matches = []
+    for m, n in knn_matches:
+        if m.distance < ratio_thresh * n.distance:
+            good_matches.append(m)
+
+    return good_matches
+
+
+def draw_good_matches(img_tile, img_board, keypts_tile, keypts_board, good_matches):
+    img_matches = np.empty((max(img_tile.shape[0], img_board.shape[0]), img_tile.shape[1] + img_board.shape[1], 3),
+                           dtype=np.uint8)
+    cv2.drawMatches(img_tile, keypts_tile, img_board, keypts_board, good_matches, img_matches,
+                   flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    return img_matches
+
+
+def find_homography_tile2board(good_matches, keypts_tile, keypts_board):
+    # -- Localize the object
+    tile = np.empty((len(good_matches), 2), dtype=np.float32)
+    board = np.empty((len(good_matches), 2), dtype=np.float32)
+
+    for i in range(len(good_matches)):
+        # -- Get the keypoints from the good matches
+        tile[i, 0] = keypts_tile[good_matches[i].queryIdx].pt[0]
+        tile[i, 1] = keypts_tile[good_matches[i].queryIdx].pt[1]
+        board[i, 0] = keypts_board[good_matches[i].trainIdx].pt[0]
+        board[i, 1] = keypts_board[good_matches[i].trainIdx].pt[1]
+    H, _ = cv2.findHomography(tile, board, cv2.RANSAC)
+    return H
+
+
+def find_corners(img_tile, H_tile2board):
+    # -- Get the corners from the image_1 (the tile to be "detected")
+    tile_corners = np.empty((4, 1, 2), dtype=np.float32)
+    tile_corners[0, 0, 0] = 0
+    tile_corners[0, 0, 1] = 0
+    tile_corners[1, 0, 0] = img_tile.shape[1]
+    tile_corners[1, 0, 1] = 0
+    tile_corners[2, 0, 0] = img_tile.shape[1]
+    tile_corners[2, 0, 1] = img_tile.shape[0]
+    tile_corners[3, 0, 0] = 0
+    tile_corners[3, 0, 1] = img_tile.shape[0]
+    board_corners = cv2.perspectiveTransform(tile_corners, H_tile2board)
+
+    return tile_corners, board_corners
+
+
+def draw_tile_on_board_corners(img_matches, img_tile, board_corners):
+    cv2.line(img_matches, (int(board_corners[0, 0, 0] + img_tile.shape[1]), int(board_corners[0, 0, 1])), \
+             (int(board_corners[1, 0, 0] + img_tile.shape[1]), int(board_corners[1, 0, 1])), (0, 255, 0), 4)
+    cv2.line(img_matches, (int(board_corners[1, 0, 0] + img_tile.shape[1]), int(board_corners[1, 0, 1])), \
+             (int(board_corners[2, 0, 0] + img_tile.shape[1]), int(board_corners[2, 0, 1])), (0, 255, 0), 4)
+    cv2.line(img_matches, (int(board_corners[2, 0, 0] + img_tile.shape[1]), int(board_corners[2, 0, 1])), \
+             (int(board_corners[3, 0, 0] + img_tile.shape[1]), int(board_corners[3, 0, 1])), (0, 255, 0), 4)
+    cv2.line(img_matches, (int(board_corners[3, 0, 0] + img_tile.shape[1]), int(board_corners[3, 0, 1])), \
+             (int(board_corners[0, 0, 0] + img_tile.shape[1]), int(board_corners[0, 0, 1])), (0, 255, 0), 4)
+
+    plt.imshow(img_matches, cmap='gray', interpolation='nearest')
+    plt.xticks([])
+    plt.yticks([])
+    plt.show()
+
+
+def wrap_board2tile(img_tile, img_board, tile_corners, board_corners):
+    H, status = cv2.findHomography(board_corners, tile_corners, cv2.RANSAC, 5.0)
+    # Warp source image to destination based on homography
+    im_out = cv2.warpPerspective(img_board, H, ((int)(img_tile.shape[1]), (int)(img_tile.shape[0])))
+    return im_out
+
+
+def k_means(img_name, k):
+    img = cv2.imread(img_name + '.jpg')
+    Z = img.reshape((-1, 3))
+    Z = np.float32(Z)
+
+    # define criteria, number of clusters(K) and apply kmeans()
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    ret, label, center = cv2.kmeans(Z, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+
+
+    # kmeans = KMeans(n_clusters=k)
+    # kmeans.fit(img)
+    # colors = kmeans.cluster_centers_
+
+    # Now convert back into uint8, and make original image
+    center = np.uint8(center)
+    res = center[label.flatten()]
+    res2 = res.reshape((img.shape))
+    return res2
+
+
+def centroid_histogram(clt):
+    # grab the number of different clusters and create a histogram
+    # based on the number of pixels assigned to each cluster
+    numLabels = np.arange(0, len(np.unique(clt.labels_)) + 1)
+    (hist, _) = np.histogram(clt.labels_, bins=numLabels)
+
+    # normalize the histogram, such that it sums to one
+    hist = hist.astype("float")
+    hist /= hist.sum()
+
+    # return the histogram
+    return hist
+
+
+def plot_colors(hist, centroids):
+    # initialize the bar chart representing the relative frequency
+    # of each of the colors
+    bar = np.zeros((50, 300, 3), dtype="uint8")
+    startX = 0
+
+    # loop over the percentage of each cluster and the color of
+    # each cluster
+    for (percent, color) in zip(hist, centroids):
+        # plot the relative percentage of each cluster
+        endX = startX + (percent * 300)
+        cv2.rectangle(bar, (int(startX), 0), (int(endX), 50),
+                      color.astype("uint8").tolist(), -1)
+        startX = endX
+
+    # return the bar chart
+    return bar
+
+
+def visualize_image(img, cm=None):
+    if cm:
+        plt.imshow(img, cmap=cm, interpolation='nearest')
+    else:
+        plt.imshow(img, interpolation='nearest')
+    plt.xticks([])
+    plt.yticks([])
+    plt.show()
+
+
+
+''' Scene homography '''
+
+img_tile = cv2.imread('tiles/tile (13).jpg', cv2.IMREAD_GRAYSCALE)
+img_board = cv2.imread('tiles/board test.jpg', cv2.IMREAD_GRAYSCALE)
+
+keypts_tile, des_tile, keypts_board, des_board = find_keypoints(img_tile, img_board)
+good_matches = find_good_matches(des_tile, des_board)
+H_tile2board = find_homography_tile2board(good_matches, keypts_tile, keypts_board)
+
+tile_corners, board_corners = find_corners(img_tile, H_tile2board)
+
+img_matches = draw_good_matches(img_tile, img_board, keypts_tile, keypts_board, good_matches)
+draw_tile_on_board_corners(img_matches, img_tile, board_corners)
+
+img_board_transformed = wrap_board2tile(img_tile, img_board, tile_corners, board_corners)
+
+img_tile_color_transformed = wrap_board2tile(img_tile, cv2.cvtColor(cv2.imread('tiles/board test.jpg'), cv2.COLOR_BGR2RGB), tile_corners, board_corners)
+
+
+# Display images
+# cv2.imshow("Source Image", img_board)
+# cv2.imshow("Destination Image", img_tile)
+# cv2.imshow("Warped Source Image", img_board_transformed)
+
+visualize_image(img_tile_color_transformed)
+
+''' Testing figure finding '''
+K = 5
+
+im = Image.fromarray(img_tile_color_transformed)
+im.save("tiles/coloured_tile.jpg")
+k_means_tile = k_means('tiles/coloured_tile', K)
+visualize_image(k_means_tile)
+
+
+image = img_tile_color_transformed.reshape((img_tile_color_transformed.shape[0] * img_tile_color_transformed.shape[1], 3))
+clt = KMeans(n_clusters=K)
+clt.fit(image)
+hist = centroid_histogram(clt)
+bar = plot_colors(hist, clt.cluster_centers_)
+
+plt.figure()
+plt.axis("off")
+plt.imshow(bar)
+plt.show()
+
+
+
+
+
+
+H, status = cv2.findHomography(board_corners, tile_corners, cv2.RANSAC, 5.0)
+img_out = cv2.warpPerspective(img_board, H, ((int)(img_tile.shape[1]), (int)(img_tile.shape[0])))
+visualize_image(img_out, 'gray')
+
+
+src = img_board
+dst = img_tile
+
+# Find the corners after the transform has been applied
+height, width = src.shape[:2]
+corners = np.array([
+  [0, 0],
+  [0, height - 1],
+  [width - 1, height - 1],
+  [width - 1, 0]
+])
+corners = cv2.perspectiveTransform(np.float32([corners]), H)[0]
+
+# Find the bounding rectangle
+bx, by, bwidth, bheight = cv2.boundingRect(corners)
+
+# Compute the translation homography that will move (bx, by) to (0, 0)
+H_trans = np.array([
+  [ 1, 0, -bx ],
+  [ 0, 1, -by ],
+  [ 0, 0,   1 ]
+])
+
+# Combine the homographies
+pth = H_trans.dot(H)
+
+# Apply the transformation to the image
+warped = cv2.warpPerspective(src, pth, (bwidth, bheight),
+                             flags=cv2.INTER_CUBIC,
+                             borderMode=cv2.BORDER_CONSTANT)
+
+
+corners = np.array([
+  [0, 0],
+  [0, height - 1],
+  [width - 1, height - 1],
+  [width - 1, 0]
+])
+corners = cv2.perspectiveTransform(np.float32([corners]), pth)[0]
+bx2, by2, bwidth2, bheight2 = cv2.boundingRect(corners)
+
+print(bx, by, bwidth, bheight)
+print(bx2, by2, bwidth2, bheight2)
+
+
+
+img_test = cv2.warpPerspective(img_board, pth, (bwidth2, bheight2))
+visualize_image(img_test, 'gray')
+
+
+# Display image - to big...
+# cv2.imshow("Whole Image", img_test)
+
+# im = Image.fromarray(img_test)
+# im.save("board_transformation.jpeg")
+
+
+cv2.waitKey(0)
